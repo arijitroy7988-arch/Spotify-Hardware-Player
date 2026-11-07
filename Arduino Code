@@ -1,0 +1,383 @@
+#include <Arduino.h>
+// ============================================================
+//  Spotify Mini-Player — Arduino UNO R4 WiFi
+//  Hardware : 20x4 I2C LCD, 4 buttons (D2-D5), pot (A0)
+//  Comms    : WiFi UDP → Python bridge on host PC
+//  LCD modes: INFO (song/artist/status/vol) ↔ LYRICS
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiS3.h>
+#include <ArduinoJson.h>
+
+// ── WiFi credentials (edit to match your network) ───────────
+
+enum DisplayMode { MODE_INFO, MODE_LYRICS };
+
+struct PlaybackState {
+  String  title;
+  String  artist;
+  bool    isPlaying;
+  int     positionSec;
+  int     durationSec;
+  int     volume;         // 0-100 Spotify volume
+  String  lyrics[4];      // four synchronized lyric lines
+  bool    dirty;          // true = LCD needs refresh
+} state;
+
+struct Button {
+  uint8_t  pin;
+  bool     lastState;
+  unsigned long lastDebounce;
+};
+
+
+// Forward declarations
+String lcdLine(const String& s, uint8_t width);
+String formatTime(int secs);
+void sendCommand(const char* cmd, const char* value);
+void sendCommandInt(const char* cmd, int value);
+void renderInfo();
+void renderLyrics();
+void refreshLcd();
+void parseIncoming(char* buf, int len);
+void handleButton(uint8_t idx);
+void pollButtons();
+void pollVolume();
+void connectWiFi();
+
+
+
+const char* WIFI_SSID     = "____(your Wifi Name)______";
+const char* WIFI_PASSWORD = "(your wifi password)";
+
+// ── Python bridge address & UDP port ────────────────────────
+const char* HOST_IP   = "____________";   // PC running Python
+const int   UDP_PORT  = 4210;
+
+// ── Pin definitions ──────────────────────────────────────────
+#define BTN_PREV  2   // Previous track
+#define BTN_PLAY  3   // Play / Pause
+#define BTN_NEXT  4   // Next track
+#define BTN_MODE  5   // Toggle INFO ↔ LYRICS
+#define POT_PIN  A0   // Volume potentiometer
+
+// ── LCD (I2C address 0x27 is most common; try 0x3F if blank) ─
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ── UDP ──────────────────────────────────────────────────────
+WiFiUDP udp;
+
+// ── Display modes ────────────────────────────────────────────
+
+DisplayMode displayMode = MODE_INFO;
+
+// ── Playback state ───────────────────────────────────────────
+
+
+// ── Button de-bounce ─────────────────────────────────────────
+
+Button buttons[4] = {
+  { BTN_PREV, HIGH, 0 },
+  { BTN_PLAY, HIGH, 0 },
+  { BTN_NEXT, HIGH, 0 },
+  { BTN_MODE, HIGH, 0 }
+};
+const unsigned long DEBOUNCE_MS = 50;
+
+// ── Volume smoothing ─────────────────────────────────────────
+int  lastSentVolume = -1;
+unsigned long lastVolSend = 0;
+const unsigned long VOL_SEND_INTERVAL = 200;  // ms between vol updates
+
+// ── LCD refresh throttle ─────────────────────────────────────
+unsigned long lastLcdRefresh = 0;
+const unsigned long LCD_REFRESH_MS = 250;
+
+// ── Helpers ──────────────────────────────────────────────────
+
+// Pad / truncate a string to exactly `width` chars for the LCD
+String lcdLine(const String& s, uint8_t width = 16) {
+  String out = s;
+  if (out.length() > width) out = out.substring(0, width);
+  while ((uint8_t)out.length() < width) out += ' ';
+  return out;
+}
+
+// Format mm:ss from total seconds
+String formatTime(int secs) {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", secs / 60, secs % 60);
+  return String(buf);
+}
+
+void sendCommand(const char* cmd, const char* value = "") {
+  StaticJsonDocument<128> doc;
+  doc["cmd"]   = cmd;
+  doc["value"] = value;
+  char buf[128];
+  serializeJson(doc, buf);
+  udp.beginPacket(HOST_IP, UDP_PORT);
+  udp.write((uint8_t*)buf, strlen(buf));
+  udp.endPacket();
+}
+
+void sendCommandInt(const char* cmd, int value) {
+  StaticJsonDocument<64> doc;
+  doc["cmd"]   = cmd;
+  doc["value"] = value;
+  char buf[64];
+  serializeJson(doc, buf);
+  udp.beginPacket(HOST_IP, UDP_PORT);
+  udp.write((uint8_t*)buf, strlen(buf));
+  udp.endPacket();
+}
+
+// ── LCD rendering ────────────────────────────────────────────
+
+void renderInfo() {
+  // Line 0: Song title (scrolls via truncation — 20 chars)
+  lcd.setCursor(0, 0);
+  lcd.print(lcdLine(state.title));
+
+  // Line 1: Artist
+  lcd.setCursor(0, 1);
+  lcd.print(lcdLine(state.artist));
+
+  // Line 2: Play status + time (e.g. "> 01:23 / 03:45")
+  String status = state.isPlaying ? "> " : "|| ";
+  String timeStr = formatTime(state.positionSec) + " / " + formatTime(state.durationSec);
+  lcd.setCursor(0, 2);
+  lcd.print(lcdLine(status + timeStr));
+
+  // Line 3: Volume bar  "VOL: 75%  [#######   ]"
+  String volStr = "VOL: " + String(state.volume) + "%";
+  lcd.setCursor(0, 3);
+  lcd.print(lcdLine(volStr));
+}
+
+void renderLyrics() {
+  lcd.setCursor(0, 0);
+  lcd.print(lcdLine(state.lyrics[0]));
+
+  lcd.setCursor(0, 1);
+  lcd.print(lcdLine(state.lyrics[1]));
+}
+
+
+void refreshLcd() {
+  if (displayMode == MODE_INFO)   renderInfo();
+  else                             renderLyrics();
+  state.dirty = false;
+}
+
+// ── Incoming UDP parsing ─────────────────────────────────────
+
+void parseIncoming(char* buf, int len) {
+  buf[len] = '\0';
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, buf);
+  if (err) return;
+
+  bool changed = false;
+  if (doc.containsKey("title"))   { state.title      = doc["title"].as<String>();     changed = true; }
+  if (doc.containsKey("artist"))  { state.artist     = doc["artist"].as<String>();    changed = true; }
+  if (doc.containsKey("playing")) { state.isPlaying  = doc["playing"].as<bool>();     changed = true; }
+  if (doc.containsKey("pos"))     { state.positionSec = doc["pos"].as<int>();         changed = true; }
+  if (doc.containsKey("dur"))     { state.durationSec = doc["dur"].as<int>();         changed = true; }
+  if (doc.containsKey("vol"))     { state.volume     = doc["vol"].as<int>();          changed = true; }
+
+  // Lyrics lines: "l0".."l3"
+  for (uint8_t i = 0; i < 4; i++) {
+    char key[3] = { 'l', (char)('0' + i), '\0' };
+    if (doc.containsKey(key)) {
+      state.lyrics[i] = doc[key].as<String>();
+      changed = true;
+    }
+  }
+  if (changed) state.dirty = true;
+}
+
+// ── Button handling ──────────────────────────────────────────
+
+void handleButton(uint8_t idx) {
+  switch (idx) {
+    case 0: sendCommand("prev");   break;
+    case 1: sendCommand("toggle"); break;
+    case 2: sendCommand("next");   break;
+    case 3:
+      displayMode = (displayMode == MODE_INFO) ? MODE_LYRICS : MODE_INFO;
+      lcd.clear();
+      state.dirty = true;
+      break;
+  }
+}
+
+void pollButtons() {
+  static bool lastReading[4] = {HIGH, HIGH, HIGH, HIGH};
+  static bool stableState[4] = {HIGH, HIGH, HIGH, HIGH};
+  static unsigned long changedAt[4] = {0, 0, 0, 0};
+
+  unsigned long now = millis();
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    bool reading = digitalRead(buttons[i].pin);
+
+    // Raw reading changed
+    if (reading != lastReading[i]) {
+      changedAt[i] = now;
+      lastReading[i] = reading;
+    }
+
+    // Reading has remained unchanged long enough
+    if ((now - changedAt[i]) > DEBOUNCE_MS) {
+
+      if (reading != stableState[i]) {
+        stableState[i] = reading;
+
+        // INPUT_PULLUP means LOW = pressed
+        if (stableState[i] == LOW) {
+          handleButton(i);
+        }
+      }
+    }
+  }
+}
+
+
+// ── Volume polling ───────────────────────────────────────────
+
+void pollVolume() {
+  unsigned long now = millis();
+  if (now - lastVolSend < VOL_SEND_INTERVAL) return;
+  lastVolSend = now;
+
+  int raw = analogRead(POT_PIN);          // 0 – 1023
+  int vol = map(raw, 0, 1023, 0, 100);
+  if (abs(vol - lastSentVolume) >= 2) {   // deadband to avoid jitter
+    sendCommandInt("volume", vol);
+    lastSentVolume = vol;
+    state.volume   = vol;
+    state.dirty    = true;
+  }
+}
+
+// ── WiFi connect ─────────────────────────────────────────────
+
+void connectWiFi() {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Connecting WiFi...");
+  lcd.setCursor(0, 1); lcd.print(WIFI_SSID);
+
+  // Call begin() ONCE — UNO R4 WiFi is async, poll status() separately
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+    delay(500);
+    attempts++;
+    // Blink dots on line 0 so user knows it's trying
+    lcd.setCursor(18, 0);
+    lcd.print((attempts % 2 == 0) ? "." : " ");
+    // Show attempt count on line 2
+    lcd.setCursor(0, 2);
+    char attBuf[20];
+    snprintf(attBuf, sizeof(attBuf), "Attempt: %d/60      ", attempts);
+    lcd.print(attBuf);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // Build IP string — convert each octet manually, guaranteed on UNO R4
+    IPAddress ip = WiFi.localIP();
+    char ipStr[16];
+    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
+    // Print to Serial Monitor — open at 115200 baud to read it there too
+    Serial.println();
+    Serial.println("==============================");
+    Serial.print("WiFi Connected! IP Address: ");
+    Serial.println(ipStr);
+    Serial.println("==============================");
+
+    // Show on LCD — stays for 8 seconds so you have time to write it down
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("WiFi Connected! :)  ");
+    lcd.setCursor(0, 1); lcd.print(lcdLine(String(WIFI_SSID)));
+    lcd.setCursor(0, 2); lcd.print("IP Address:         ");
+    lcd.setCursor(0, 3); lcd.print(lcdLine(String(ipStr)));
+    delay(8000);  // 8 seconds — enough time to read and write it down
+  } else {
+    Serial.println();
+    Serial.println("WiFi FAILED — check SSID/password and 2.4GHz band");
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("WiFi FAILED :(      ");
+    lcd.setCursor(0, 1); lcd.print("Check SSID/Password ");
+    lcd.setCursor(0, 2); lcd.print("2.4GHz band only!   ");
+    lcd.setCursor(0, 3); lcd.print("Restart to retry    ");
+    delay(5000);
+  }
+}
+
+// ── Setup ────────────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+
+  // Buttons: INPUT_PULLUP — LOW when pressed
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_PLAY, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_MODE, INPUT_PULLUP);
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("  Spotify Player   ");
+  lcd.setCursor(0, 1); lcd.print("  Arduino UNO R4   ");
+  delay(1500);
+
+  // WiFi
+  connectWiFi();
+
+  // UDP listen
+  udp.begin(UDP_PORT);
+
+  // Default state
+  state.title       = "Waiting...";
+  state.artist      = "Start Python bridge";
+  state.isPlaying   = false;
+  state.positionSec = 0;
+  state.durationSec = 0;
+  state.volume      = 50;
+  for (uint8_t i = 0; i < 4; i++) state.lyrics[i] = "";
+  state.dirty = true;
+}
+
+// ── Loop ─────────────────────────────────────────────────────
+
+void loop() {
+  // 1. Receive UDP from Python bridge
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0 && packetSize < 511) {
+    char buf[512];
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len > 0) parseIncoming(buf, len);
+  }
+
+  // 2. Poll buttons
+  pollButtons();
+
+  // 3. Poll volume pot
+  pollVolume();
+
+  // 4. Refresh LCD on change, throttled
+  unsigned long now = millis();
+  if (state.dirty && (now - lastLcdRefresh >= LCD_REFRESH_MS)) {
+    refreshLcd();
+    lastLcdRefresh = now;
+  }
+}
