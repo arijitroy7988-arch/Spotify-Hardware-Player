@@ -1,0 +1,287 @@
+"""
+Spotify Mini-Player — Python Bridge
+Runs on the host PC.  Polls the Spotify Web API and relays state to the
+Arduino over UDP.  Receives commands from the Arduino and translates them
+back to Spotify API calls.
+
+Requirements (install with pip):
+    pip install spotipy
+
+Setup:
+  1. Create a Spotify Developer app at https://developer.spotify.com/dashboard
+  2. Set Redirect URI to https://localhost:8888/callback
+  3. Fill in CLIENT_ID, CLIENT_SECRET below.
+  4. Set ARDUINO_IP to the IP shown on the LCD after WiFi connects.
+  5. Run:  python (spotify_bridge.py)
+"""
+
+import socket
+import json
+import time
+import threading
+import re
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+import textwrap
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+# ── Configuration ────────────────────────────────────────────
+CLIENT_ID     = "___________"
+CLIENT_SECRET = "__________________"
+REDIRECT_URI = "http://127.0.0.1:8888/callback"
+
+ARDUINO_IP    = "____________"   # ← Replace with IP shown on LCD
+UDP_PORT      = 4210
+
+POLL_INTERVAL = 1.0   # seconds between Spotify API polls
+# ────────────────────────────────────────────────────────────
+
+SCOPE = (
+    "user-read-playback-state "
+    "user-modify-playback-state "
+    "user-read-currently-playing"
+)
+
+sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    redirect_uri=REDIRECT_URI,
+    scope=SCOPE
+))
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("", UDP_PORT))
+sock.settimeout(0.05)
+
+# Saved lyrics for the song currently playing.
+# Each entry is: (time in seconds from song start, lyric text)
+lyrics_cache_key = None
+lyrics_cache = []
+
+# Reads lyric timestamps such as [01:23.45]Hello
+LRC_LINE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)")
+
+
+def send_state(state: dict):
+    payload = json.dumps(state).encode()
+    sock.sendto(payload, (ARDUINO_IP, UDP_PORT))
+
+
+def parse_synced_lyrics(lrc_text: str):
+    """Turn timed lyric text into a list of (seconds, text) entries."""
+    parsed = []
+
+    if not lrc_text:
+        return parsed
+
+    for raw_line in lrc_text.splitlines():
+        match = LRC_LINE.match(raw_line)
+
+        if not match:
+            continue
+
+        minutes = int(match.group(1))
+        seconds = float(match.group(2))
+        text = match.group(3).strip()
+
+        if text:
+            parsed.append((minutes * 60 + seconds, text))
+
+    return sorted(parsed, key=lambda line: line[0])
+
+
+def lookup_lyrics(title: str, artist: str, album: str, duration: int):
+    """Ask LRCLIB for synchronized lyrics for the current Spotify track."""
+    params = urlencode({
+        "track_name": title,
+        "artist_name": artist,
+        "album_name": album,
+        "duration": duration,
+    })
+
+    request = Request(
+        "https://lrclib.net/api/get?" + params,
+        headers={"User-Agent": "ArduinoSpotifyMiniPlayer/1.0"},
+    )
+
+    try:
+        with urlopen(request, timeout=8) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        return parse_synced_lyrics(result.get("syncedLyrics", ""))
+
+    except Exception as error:
+        print(f"[Lyrics] No timed lyrics found: {error}")
+        return []
+
+
+def lyric_window(position_seconds: int):
+    """Show the current lyric and following lyrics, wrapped to 20 LCD columns."""
+    if not lyrics_cache:
+        return [
+            "No timed lyrics found",
+            "for this track.",
+            "Try another song, or",
+            "return to Info mode.",
+        ]
+
+    current_index = 0
+
+    for index, (timestamp, _) in enumerate(lyrics_cache):
+        if timestamp <= position_seconds:
+            current_index = index
+        else:
+            break
+
+    # Turn long lyric lines into whole-word pieces no longer than 20 characters.
+    lcd_lines = []
+
+    for _, lyric_text in lyrics_cache[current_index:]:
+        wrapped = textwrap.wrap(
+            lyric_text,
+            width=20,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+
+        # Keep blank lyric lines from disappearing completely.
+        if not wrapped:
+            wrapped = [""]
+
+        lcd_lines.extend(wrapped)
+
+        # The LCD has four physical rows, so stop once they are full.
+        if len(lcd_lines) >= 4:
+            break
+
+    # Ensure l0 through l3 always exist.
+    while len(lcd_lines) < 4:
+        lcd_lines.append("")
+
+    return lcd_lines[:4]
+
+
+
+
+def fetch_state():
+    global lyrics_cache_key, lyrics_cache
+
+    try:
+        pb = sp.current_playback()
+
+        if not pb or not pb.get("item"):
+            return None
+
+        item = pb["item"]
+
+        title = item.get("name", "")
+        artists = ", ".join(
+            artist["name"] for artist in item.get("artists", [])
+        )
+        album = item.get("album", {}).get("name", "")
+        duration = item.get("duration_ms", 0) // 1000
+        position = pb.get("progress_ms", 0) // 1000
+
+        # This identifies the song. Lyrics are only downloaded when it changes.
+        track_key = (
+            item.get("id", title),
+            title,
+            artists,
+            album,
+            duration,
+        )
+
+        if track_key != lyrics_cache_key:
+            lyrics_cache_key = track_key
+            lyrics_cache = lookup_lyrics(title, artists, album, duration)
+
+            if lyrics_cache:
+                print(
+                    f"[Lyrics] Loaded {len(lyrics_cache)} timed lines "
+                    f"for {title!r}"
+                )
+            else:
+                print(f"[Lyrics] No timed lyrics available for {title!r}")
+
+        lines = lyric_window(position)
+
+        return {
+            "title": title[:40],
+            "artist": artists[:40],
+            "playing": pb.get("is_playing", False),
+            "pos": position,
+            "dur": duration,
+            "vol": pb.get("device", {}).get("volume_percent", 50),
+
+            # These four replace your old fixed Lyrics test line entries.
+            "l0": lines[0][:20],
+            "l1": lines[1][:20],
+            "l2": lines[2][:20],
+            "l3": lines[3][:20],
+        }
+
+    except Exception as error:
+        print(f"[Spotify] fetch error: {error}")
+        return None
+
+
+
+def handle_command(cmd: dict):
+    action = cmd.get("cmd", "")
+    value  = cmd.get("value")
+    try:
+        if action == "toggle":
+            pb = sp.current_playback()
+            if pb and pb.get("is_playing"):
+                sp.pause_playback()
+            else:
+                sp.start_playback()
+        elif action == "next":
+            sp.next_track()
+        elif action == "prev":
+            sp.previous_track()
+        elif action == "volume":
+            vol = max(0, min(100, int(value)))
+            sp.volume(vol)
+    except Exception as e:
+        print(f"[Command] {action} error: {e}")
+
+
+def receive_loop():
+    while True:
+        try:
+            data, _ = sock.recvfrom(256)
+            cmd = json.loads(data.decode())
+            handle_command(cmd)
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"[UDP recv] {e}")
+
+
+def main():
+    print("Spotify Bridge started.  Listening on UDP", UDP_PORT)
+    t = threading.Thread(target=receive_loop, daemon=True)
+    t.start()
+
+    while True:
+        state = fetch_state()
+        if state:
+            send_state(state)
+            print(
+                f"[→ Arduino] {state['title'][:25]!r:25s}  "
+                f"{'>' if state['playing'] else '||'}  "
+                f"{state['pos']//60:02d}:{state['pos']%60:02d}  "
+                f"vol={state['vol']}%"
+            )
+        else:
+            send_state({
+                "title": "Nothing playing", "artist": "",
+                "playing": False, "pos": 0, "dur": 0, "vol": 0
+            })
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
