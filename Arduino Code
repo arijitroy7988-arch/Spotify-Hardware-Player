@@ -1,10 +1,4 @@
 #include <Arduino.h>
-// ============================================================
-//  Spotify Mini-Player — Arduino UNO R4 WiFi
-//  Hardware : 20x4 I2C LCD, 4 buttons (D2-D5), pot (A0)
-//  Comms    : WiFi UDP → Python bridge on host PC
-//  LCD modes: INFO (song/artist/status/vol) ↔ LYRICS
-// ============================================================
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
